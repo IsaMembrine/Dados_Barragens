@@ -1,0 +1,29 @@
+name: Atualizar dados do gateway
+
+on:
+  schedule:
+    - cron: '0 12 * * *'  # Executa todo dia às 12h UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    env:
+      GATEWAY_USERNAME: ${{ secrets.GATEWAY_USERNAME }}
+      GATEWAY_PASSWORD: ${{ secrets.GATEWAY_PASSWORD }}
+
+    steps:
+      - name: Checkout do repositório
+        uses: actions/checkout@v3
+
+      - name: Configurar Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Instalar dependências
+        run: |
+          pip install requests pandas beautifulsoup4
+
+      - name: Executar script de atualização
+        run: python update_data.py
