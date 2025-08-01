@@ -1,23 +1,27 @@
-
-# update_data.py
-import os
-import io
-import re
-import zipfile
-import requests
+# app.py
+import streamlit as st
 import pandas as pd
+import requests
+import io
+import zipfile
+import re
+import os
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 
-# Autenticação via variáveis de ambiente
+st.set_page_config(page_title="Monitoramento de Barragens", layout="wide")
+
+# 🔐 Autenticação via secrets do Streamlit Cloud
 auth = (
-    os.getenv("GATEWAY_USERNAME"),
-    os.getenv("GATEWAY_PASSWORD")
+    st.secrets["GATEWAY_USERNAME"],
+    st.secrets["GATEWAY_PASSWORD"]
 )
 
 base_url = 'https://loadsensing.wocs3.com'
-urls = [f'{base_url}/27920/dataserver/node/view/{nid}' for nid in [1006, 1007, 1008, 1010, 1011, 1012]]
+node_ids = [1006, 1007, 1008, 1010, 1011, 1012]
+urls = [f'{base_url}/27920/dataserver/node/view/{nid}' for nid in node_ids]
 
+# 📥 Coleta de links
 def coletar_links():
     all_file_links = {}
     for url in urls:
@@ -25,13 +29,15 @@ def coletar_links():
             r = requests.get(url, auth=auth)
             soup = BeautifulSoup(r.text, 'html.parser')
             node_id = re.search(r'/view/(\d+)$', url).group(1)
-            file_links = [a['href'] for a in soup.find_all('a', href=True) if a['href'].endswith(('.csv', '.zip'))]
+            file_links = [a['href'] for a in soup.find_all('a', href=True)
+                          if a['href'].endswith(('.csv', '.zip'))]
             if file_links:
                 all_file_links[node_id] = file_links
         except Exception as e:
-            print(f"Erro em {url}: {e}")
+            st.error(f"Erro ao coletar links de {url}: {e}")
     return all_file_links
 
+# 🧲 Download dos arquivos
 def baixar_arquivos(all_file_links):
     hoje = datetime.now()
     limite_data = hoje.replace(day=1)
@@ -64,39 +70,32 @@ def baixar_arquivos(all_file_links):
             full_url = base_url + link
             response = requests.get(full_url, auth=auth)
             if response.status_code == 200:
-                filepath = f"{node_id}_{filename}"
-                with open(filepath, 'wb') as f:
-                    f.write(response.content)
-                downloaded_files[node_id].append(filepath)
+                downloaded_files[node_id].append((filename, response.content))
     return downloaded_files
 
+# 🧹 Processamento dos arquivos
 def processar_arquivos(downloaded_files):
     all_dataframes = {}
-    hoje = datetime.now()
-    limite_data = hoje.replace(day=1)
-    three_months_ago = limite_data - timedelta(days=90)
-
     for node_id, files in downloaded_files.items():
         dfs_node = []
-        for fp in files:
-            if 'health' in fp.lower():
+        for filename, content in files:
+            if 'health' in filename.lower():
                 continue
-            if fp.endswith('.csv'):
+            if filename.endswith('.csv'):
                 try:
-                    df = pd.read_csv(fp, skiprows=9)
+                    df = pd.read_csv(io.BytesIO(content), skiprows=9)
                     dfs_node.append(df)
                 except:
                     continue
-            elif fp.endswith('.zip'):
+            elif filename.endswith('.zip'):
                 try:
-                    with zipfile.ZipFile(fp, 'r') as zf:
+                    with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
                         for fn in zf.namelist():
-                            if 'health' in fn.lower():
+                            if 'health' in fn.lower() or not fn.endswith('.csv'):
                                 continue
-                            if fn.endswith('.csv'):
-                                with zf.open(fn) as f:
-                                    df = pd.read_csv(io.TextIOWrapper(f, 'utf-8'), skiprows=9)
-                                    dfs_node.append(df)
+                            with zf.open(fn) as f:
+                                df = pd.read_csv(io.TextIOWrapper(f, 'utf-8'), skiprows=9)
+                                dfs_node.append(df)
                 except:
                     continue
         if dfs_node:
@@ -104,25 +103,25 @@ def processar_arquivos(downloaded_files):
             all_dataframes[node_id] = df_concat
     return all_dataframes
 
-def analisar_e_salvar(all_dataframes):
+# 📊 Análise e visualização
+def analisar_e_visualizar(all_dataframes):
     first_node = list(all_dataframes.keys())[0]
     todos_nos = all_dataframes[first_node].copy()
     for node_id, df in all_dataframes.items():
         if node_id != first_node and 'Date-and-time' in df.columns:
-            todos_nos = pd.merge(todos_nos, df, on='Date-and-time', how='outer', suffixes=('', f'_{node_id}'))
+            todos_nos = pd.merge(todos_nos, df, on='Date-and-time', how='outer',
+                                 suffixes=('', f'_{node_id}'))
 
     todos_nos['Date-and-time'] = pd.to_datetime(todos_nos['Date-and-time'], errors='coerce')
     todos_nos.dropna(subset=['Date-and-time'], inplace=True)
     todos_nos['Date'] = todos_nos['Date-and-time'].dt.date
     todos_nos['Time_Rounded'] = todos_nos['Date-and-time'].dt.round('h').dt.time
 
-    df_cleaned = todos_nos.copy()
-    df_cleaned.drop_duplicates(subset=['Date', 'Time_Rounded'], inplace=True)
+    df_cleaned = todos_nos.drop_duplicates(subset=['Date', 'Time_Rounded'])
 
     p_cols = [c for c in df_cleaned.columns if c.startswith('p-')]
     df_selected = df_cleaned[['Date-and-time', 'Time_Rounded'] + p_cols].copy()
 
-    # 🔁 Usando Date-and-time corretamente como datetime64
     melted = df_selected.melt(
         id_vars=['Date-and-time', 'Time_Rounded'],
         value_vars=p_cols,
@@ -136,21 +135,27 @@ def analisar_e_salvar(all_dataframes):
     counts['Days_in_Month'] = counts['Month'].dt.days_in_month
     counts['Max_Data'] = counts['Days_in_Month'] * 24
     counts['Monthly_Attendance_Percentage'] = (counts['Monthly_Data_Count'] / counts['Max_Data']) * 100
-    monthy_selecionado = counts[['Month', 'Node_ID', 'Monthly_Attendance_Percentage']].copy()
+    monthy_selecionado = counts[['Month', 'Node_ID', 'Monthly_Attendance_Percentage']]
     monthy_selecionado['Month'] = monthy_selecionado['Month'].astype(str)
-    monthy_selecionado.to_csv("monthy_selecionado.csv", index=False)
 
-    node_ids = {re.search(r'-(\d+)-', c).group(1) for c in todos_nos.columns if re.search(r'-(\d+)-', c)}
-    node_column_pairs = {}
-    for nid in node_ids:
-        f_col = f'freqInHz-{nid}-VW-Ch1'
-        p_col = f'p-{nid}-Ch1'
-        if f_col in todos_nos.columns and p_col in todos_nos.columns:
-            node_column_pairs
+    st.subheader("📈 Presença Mensal de Dados por Nó")
+    st.dataframe(monthy_selecionado)
 
-# Example usage (can be moved to a main execution block or separate script)
-# file_links = coletar_links()
-# downloaded_files = baixar_arquivos(file_links)
-# dfs = processar_arquivos(downloaded_files)
-# analisar_e_salvar(dfs)
+    st.bar_chart(monthy_selecionado.pivot(index="Month", columns="Node_ID",
+                                          values="Monthly_Attendance_Percentage"))
+
+# ▶️ Interface principal
+st.title("Monitoramento de Barragens 🌊")
+st.write("Esse aplicativo coleta e analisa dados de sensores via Gateway Loadsensing.")
+
+if st.button("Executar análise dos dados agora"):
+    with st.spinner("Coletando links..."):
+        links = coletar_links()
+    with st.spinner("Baixando arquivos..."):
+        arquivos = baixar_arquivos(links)
+    with st.spinner("Processando dados..."):
+        dfs = processar_arquivos(arquivos)
+    with st.spinner("Analisando e exibindo resultados..."):
+        analisar_e_visualizar(dfs)
+    st.success("Análise finalizada com sucesso! ✅")
 
